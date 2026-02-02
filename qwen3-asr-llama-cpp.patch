@@ -1,0 +1,863 @@
+diff --git a/convert_hf_to_gguf.py b/convert_hf_to_gguf.py
+index eb43520..15fd777 100755
+--- a/convert_hf_to_gguf.py
++++ b/convert_hf_to_gguf.py
+@@ -9584,6 +9584,126 @@ class AudioFlamingo3WhisperEncoderModel(WhisperEncoderModel):
+         return super().tensor_force_quant(name, new_name, bid, n_dims)
+ 
+ 
++@ModelBase.register("Qwen3ASRForConditionalGeneration")
++class Qwen3ASREncoderModel(MmprojModel):
++    """Qwen3-ASR audio encoder → GGUF mmproj conversion."""
++    has_vision_encoder = False
++    has_audio_encoder = True
++
++    def __init__(self, *args, **kwargs):
++        # Qwen3-ASR nests configs under thinker_config — flatten them for MmprojModel
++        if "hparams" not in kwargs or kwargs["hparams"] is None:
++            import json
++            dir_model = args[0] if args else kwargs.get("dir_model")
++            cfg_path = Path(dir_model) / "config.json"
++            with open(cfg_path, "r", encoding="utf-8") as f:
++                cfg = json.load(f)
++            if "thinker_config" in cfg:
++                tc = cfg["thinker_config"]
++                cfg["audio_config"] = tc.get("audio_config", {})
++                cfg["text_config"] = tc.get("text_config", {})
++            kwargs["hparams"] = cfg
++        super().__init__(*args, **kwargs)
++        # Ensure audio hparams are accessible
++        audio_cfg = self.global_config.get("audio_config", {})
++        if audio_cfg and "hidden_size" not in self.hparams:
++            self.hparams["hidden_size"] = audio_cfg["d_model"]
++            self.hparams["intermediate_size"] = audio_cfg["encoder_ffn_dim"]
++            self.hparams["num_attention_heads"] = audio_cfg["encoder_attention_heads"]
++            self.hparams["num_hidden_layers"] = audio_cfg["encoder_layers"]
++
++    def set_gguf_parameters(self):
++        super().set_gguf_parameters()
++        self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.QWEN3ASR)
++        audio_cfg = self.global_config.get("audio_config", self.global_config.get("thinker_config", {}).get("audio_config", {}))
++        self.gguf_writer.add_audio_num_mel_bins(audio_cfg["num_mel_bins"])
++        self.gguf_writer.add_audio_attention_layernorm_eps(audio_cfg.get("layer_norm_eps", 1e-5))
++        # Qwen3-ASR specific hparams
++        self.gguf_writer.add_uint32("clip.audio.downsample_hidden_size", audio_cfg["downsample_hidden_size"])
++        self.gguf_writer.add_uint32("clip.audio.max_source_positions", audio_cfg["max_source_positions"])
++        self.gguf_writer.add_uint32("clip.audio.n_window", audio_cfg["n_window"])
++        self.gguf_writer.add_uint32("clip.audio.n_window_infer", audio_cfg.get("n_window_infer", audio_cfg["n_window"] * 4))
++        self.gguf_writer.add_uint32("clip.audio.conv_chunksize", audio_cfg.get("conv_chunksize", audio_cfg["n_window"] * 2))
++
++    def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
++        # Generate sinusoidal positional embeddings (registered as buffer, not in safetensors)
++        audio_cfg = self.global_config.get("audio_config", self.global_config.get("thinker_config", {}).get("audio_config", {}))
++        d_model = audio_cfg["d_model"]
++        max_pos = audio_cfg["max_source_positions"]
++
++        import torch
++        import math
++        pe = torch.zeros(max_pos, d_model)
++        position = torch.arange(0, max_pos, dtype=torch.float32).unsqueeze(1)
++        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / d_model))
++        pe[:, 0::2] = torch.sin(position * div_term)
++        pe[:, 1::2] = torch.cos(position * div_term)
++        yield ("audio_tower.positional_embedding.positional_embedding", pe)
++
++    def tensor_force_quant(self, name, new_name, bid, n_dims):
++        if ".conv2d" in name and ".weight" in name:
++            return gguf.GGMLQuantizationType.F16
++        return super().tensor_force_quant(name, new_name, bid, n_dims)
++
++    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
++        if name.startswith("thinker.audio_tower."):
++            # Strip "thinker." prefix so names match tensor_mapping entries
++            name = name[len("thinker."):]
++        elif not name.startswith("audio_tower."):
++            # Skip text decoder and other tensors (but allow extra tensors with audio_tower. prefix)
++            return
++
++        # Conv2d bias needs reshape for ggml broadcast: [C] → [C, 1, 1]
++        if "conv2d" in name and "bias" in name:
++            data_torch = data_torch.unsqueeze(-1).unsqueeze(-1)
++
++        yield from super().modify_tensors(data_torch, name, bid)
++
++
++@ModelBase.register("Qwen3ASRForConditionalGeneration")
++class Qwen3ASRTextModel(Qwen3Model):
++    """Qwen3-ASR text decoder model."""
++    model_arch = gguf.MODEL_ARCH.QWEN3
++
++    def __init__(self, *args, **kwargs):
++        # Flatten thinker_config.text_config to top level for Qwen3Model compatibility
++        if "hparams" not in kwargs or kwargs["hparams"] is None:
++            import json
++            dir_model = args[0] if args else kwargs.get("dir_model")
++            cfg_path = Path(dir_model) / "config.json"
++            with open(cfg_path, "r", encoding="utf-8") as f:
++                cfg = json.load(f)
++            if "thinker_config" in cfg:
++                tc = cfg["thinker_config"]
++                text_cfg = tc.get("text_config", {})
++                # Merge text config to top level
++                flat_cfg = {**cfg, **text_cfg}
++                flat_cfg["architectures"] = ["Qwen3ForCausalLM"]
++                flat_cfg["model_type"] = "qwen3"
++                kwargs["hparams"] = flat_cfg
++        super().__init__(*args, **kwargs)
++
++    def set_vocab(self):
++        super().set_vocab()
++        # The GPT2 tokenizer default in llama.cpp sets BOS=EOS=11 (comma).
++        # Override with the correct values from generation_config.json.
++        # EOS tokens: 151643 (<|endoftext|>), 151645 (<|im_end|>)
++        # The <|im_end|> is auto-detected as EOT, so set EOS to <|endoftext|>.
++        self.gguf_writer.add_bos_token_id(151643)  # <|endoftext|>
++        self.gguf_writer.add_eos_token_id(151643)  # <|endoftext|>
++
++    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
++        # Skip audio tower tensors
++        if "audio_tower" in name:
++            return
++
++        # Strip "thinker." prefix from text decoder tensors
++        if name.startswith("thinker."):
++            name = name[len("thinker."):]
++
++        yield from super().modify_tensors(data_torch, name, bid)
++
++
+ @ModelBase.register("FalconH1ForCausalLM")
+ class FalconH1Model(Mamba2Model):
+     model_arch = gguf.MODEL_ARCH.FALCON_H1
+diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
+index 31273b2..a6de2fc 100644
+--- a/gguf-py/gguf/constants.py
++++ b/gguf-py/gguf/constants.py
+@@ -716,6 +716,8 @@ class MODEL_TENSOR(IntEnum):
+     A_ENC_EMBD_TO_LOGITS  = auto() # lfm2
+     A_ENC_CONV1D          = auto()
+     A_ENC_CONV1D_NORM     = auto() # gemma3n
++    A_ENC_CONV2D          = auto() # qwen3-asr
++    A_ENC_CONV_OUT        = auto() # qwen3-asr
+     A_PRE_NORM            = auto()
+     A_POST_NORM           = auto()
+     A_ENC_LAYER_PRE_NORM  = auto() # gemma3n
+@@ -1135,6 +1137,8 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
+     MODEL_TENSOR.A_ENC_EMBD_TO_LOGITS:      "a.embd_to_logits",
+     MODEL_TENSOR.A_ENC_CONV1D:              "a.conv1d.{bid}",
+     MODEL_TENSOR.A_ENC_CONV1D_NORM:         "a.conv1d.{bid}.norm",
++    MODEL_TENSOR.A_ENC_CONV2D:              "a.conv2d.{bid}",
++    MODEL_TENSOR.A_ENC_CONV_OUT:            "a.conv_out",
+     MODEL_TENSOR.A_PRE_NORM:                "a.pre_ln",
+     MODEL_TENSOR.A_POST_NORM:               "a.post_ln",
+     MODEL_TENSOR.A_ENC_LAYER_PRE_NORM:      "a.blk.{bid}.layer_pre_norm",
+@@ -1252,6 +1256,8 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
+         MODEL_TENSOR.A_ENC_EMBD_TO_LOGITS,
+         MODEL_TENSOR.A_ENC_CONV1D,
+         MODEL_TENSOR.A_ENC_CONV1D_NORM,
++        MODEL_TENSOR.A_ENC_CONV2D,
++        MODEL_TENSOR.A_ENC_CONV_OUT,
+         MODEL_TENSOR.A_PRE_NORM,
+         MODEL_TENSOR.A_POST_NORM,
+         MODEL_TENSOR.A_ENC_LAYER_PRE_NORM,
+@@ -3617,6 +3623,7 @@ class VisionProjectorType:
+     MUSIC_FLAMINGO = "musicflamingo" # audio
+     GLM4V = "glm4v"
+     YOUTUVL = "youtuvl"
++    QWEN3ASR = "qwen3asr" # audio
+ 
+ 
+ # Items here are (block size, type size)
+diff --git a/gguf-py/gguf/tensor_mapping.py b/gguf-py/gguf/tensor_mapping.py
+index 84aa868..5f993a6 100644
+--- a/gguf-py/gguf/tensor_mapping.py
++++ b/gguf-py/gguf/tensor_mapping.py
+@@ -1597,6 +1597,7 @@ class TensorNameMap:
+         MODEL_TENSOR.A_ENC_EMBD_POS: (
+             "audio_tower.embed_positions", # ultravox
+             "audio_embedding.embedding", # lfm2
++            "audio_tower.positional_embedding.positional_embedding", # qwen3-asr
+         ),
+ 
+         MODEL_TENSOR.A_ENC_EMBD_NORM: (
+@@ -1613,6 +1614,14 @@ class TensorNameMap:
+             "model.audio_tower.subsample_conv_projection.conv_{bid}.conv", # gemma3n
+         ),
+ 
++        MODEL_TENSOR.A_ENC_CONV2D: (
++            "audio_tower.conv2d{bid}", # qwen3-asr
++        ),
++
++        MODEL_TENSOR.A_ENC_CONV_OUT: (
++            "audio_tower.conv_out", # qwen3-asr
++        ),
++
+         MODEL_TENSOR.A_ENC_CONV1D_NORM: (
+             "model.audio_tower.subsample_conv_projection.conv_{bid}.norm", # gemma3n
+         ),
+@@ -1741,7 +1750,8 @@ class TensorNameMap:
+ 
+         MODEL_TENSOR.A_MMPROJ: (
+             "audio.multi_modal_projector.linear_{bid}", # ultravox
+-            "audio_adapter.model.{bid}" # lfm2
++            "audio_adapter.model.{bid}", # lfm2
++            "audio_tower.proj{bid}", # qwen3-asr
+         ),
+ 
+         MODEL_TENSOR.A_MMPROJ_FC: (
+diff --git a/tools/mtmd/CMakeLists.txt b/tools/mtmd/CMakeLists.txt
+index 751440a..299f8ab 100644
+--- a/tools/mtmd/CMakeLists.txt
++++ b/tools/mtmd/CMakeLists.txt
+@@ -27,6 +27,7 @@ add_library(mtmd
+             models/qwen3vl.cpp
+             models/siglip.cpp
+             models/whisper-enc.cpp
++            models/qwen3asr-enc.cpp
+             models/mobilenetv5.cpp
+             models/youtuvl.cpp
+             )
+diff --git a/tools/mtmd/clip-impl.h b/tools/mtmd/clip-impl.h
+index dd69362..38d4d92 100644
+--- a/tools/mtmd/clip-impl.h
++++ b/tools/mtmd/clip-impl.h
+@@ -59,6 +59,13 @@
+ #define KEY_A_NUM_MEL_BINS      "clip.audio.num_mel_bins"
+ #define KEY_A_PROJ_STACK_FACTOR "clip.audio.projector.stack_factor"
+ 
++// qwen3-asr specific
++#define KEY_A_DOWNSAMPLE_HIDDEN  "clip.audio.downsample_hidden_size"
++#define KEY_A_MAX_SOURCE_POS     "clip.audio.max_source_positions"
++#define KEY_A_N_WINDOW           "clip.audio.n_window"
++#define KEY_A_N_WINDOW_INFER     "clip.audio.n_window_infer"
++#define KEY_A_CONV_CHUNKSIZE     "clip.audio.conv_chunksize"
++
+ 
+ //
+ // tensor name constants
+@@ -131,6 +138,10 @@
+ #define TN_MM_NORM_PRE  "mm.a.norm_pre.%s"
+ #define TN_MM_NORM_MID  "mm.a.norm_mid.%s"
+ 
++// qwen3-asr
++#define TN_CONV2D       "a.conv2d.%d.%s"
++#define TN_CONV_OUT     "a.conv_out.%s"
++
+ // cogvlm
+ #define TN_MM_POST_FC_NORM "mm.post_fc_norm.%s"
+ #define TN_MM_H_TO_4H      "mm.up.%s"
+@@ -233,6 +244,7 @@ enum projector_type {
+     PROJECTOR_TYPE_LFM2A,
+     PROJECTOR_TYPE_GLM4V,
+     PROJECTOR_TYPE_YOUTUVL,
++    PROJECTOR_TYPE_QWEN3ASR,
+     PROJECTOR_TYPE_UNKNOWN,
+ };
+ 
+@@ -266,6 +278,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
+     { PROJECTOR_TYPE_LFM2A,     "lfm2a"},
+     { PROJECTOR_TYPE_GLM4V,     "glm4v"},
+     { PROJECTOR_TYPE_YOUTUVL,   "youtuvl"},
++    { PROJECTOR_TYPE_QWEN3ASR,  "qwen3asr"},
+ };
+ 
+ static projector_type clip_projector_type_from_string(const std::string & str) {
+diff --git a/tools/mtmd/clip-model.h b/tools/mtmd/clip-model.h
+index d4ff915..6758bcb 100644
+--- a/tools/mtmd/clip-model.h
++++ b/tools/mtmd/clip-model.h
+@@ -74,6 +74,13 @@ struct clip_hparams {
+     int32_t audio_window_len  = -1;
+     int32_t audio_hop_len     = -1;
+ 
++    // qwen3-asr specific
++    int32_t downsample_hidden_size = 0;
++    int32_t max_source_positions = 0;
++    int32_t n_window = 0;
++    int32_t n_window_infer = 0;
++    int32_t conv_chunksize = 0;
++
+     // legacy
+     bool has_llava_projector = false;
+     int minicpmv_version = 0;
+@@ -359,6 +366,15 @@ struct clip_model {
+     ggml_tensor * mm_norm_pre_b = nullptr;
+     ggml_tensor * mm_norm_mid_w = nullptr;
+ 
++    // qwen3-asr conv2d encoder
++    ggml_tensor * conv2d_1_w = nullptr;
++    ggml_tensor * conv2d_1_b = nullptr;
++    ggml_tensor * conv2d_2_w = nullptr;
++    ggml_tensor * conv2d_2_b = nullptr;
++    ggml_tensor * conv2d_3_w = nullptr;
++    ggml_tensor * conv2d_3_b = nullptr;
++    ggml_tensor * conv_out_w = nullptr;
++
+     // cogvlm
+     ggml_tensor * mm_post_fc_norm_w = nullptr;
+     ggml_tensor * mm_post_fc_norm_b = nullptr;
+diff --git a/tools/mtmd/clip.cpp b/tools/mtmd/clip.cpp
+index 9fa5afc..de0b73e 100644
+--- a/tools/mtmd/clip.cpp
++++ b/tools/mtmd/clip.cpp
+@@ -821,6 +821,10 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
+             {
+                 builder = std::make_unique<clip_graph_whisper_enc>(ctx, img);
+             } break;
++        case PROJECTOR_TYPE_QWEN3ASR:
++            {
++                builder = std::make_unique<clip_graph_qwen3asr>(ctx, img);
++            } break;
+         case PROJECTOR_TYPE_KIMIVL:
+             {
+                 builder = std::make_unique<clip_graph_kimivl>(ctx, img);
+@@ -1017,6 +1021,15 @@ struct clip_model_loader {
+                 hparams.image_size = 0;
+                 hparams.patch_size = 1;
+ 
++                // qwen3-asr specific hparams
++                if (model.proj_type == PROJECTOR_TYPE_QWEN3ASR) {
++                    get_u32(KEY_A_DOWNSAMPLE_HIDDEN, hparams.downsample_hidden_size);
++                    get_u32(KEY_A_MAX_SOURCE_POS, hparams.max_source_positions);
++                    get_u32(KEY_A_N_WINDOW, hparams.n_window);
++                    get_u32(KEY_A_N_WINDOW_INFER, hparams.n_window_infer);
++                    get_u32(KEY_A_CONV_CHUNKSIZE, hparams.conv_chunksize);
++                }
++
+             } else {
+                 GGML_ASSERT(false && "unknown modality");
+             }
+@@ -1220,6 +1233,23 @@ struct clip_model_loader {
+                         hparams.audio_window_len   = 400;
+                         hparams.audio_hop_len      = 160;
+                     } break;
++                case PROJECTOR_TYPE_QWEN3ASR:
++                    {
++                        hparams.ffn_op = FFN_GELU_ERF;
++                        log_ffn_op = "gelu_erf";
++
++                        // Whisper-compatible audio preprocessing params
++                        hparams.audio_chunk_len    = 30; // in seconds
++                        hparams.audio_sample_rate  = 16000;
++                        hparams.audio_n_fft        = 400;
++                        hparams.audio_window_len   = 400;
++                        hparams.audio_hop_len      = 160;
++
++                        // Warmup with one inference window (multiple conv chunks)
++                        hparams.warmup_audio_size = hparams.n_window_infer > 0
++                            ? hparams.n_window_infer                // 800 frames = 8 conv chunks
++                            : hparams.n_window * 2;                 // fallback: single conv chunk
++                    } break;
+                 case PROJECTOR_TYPE_LFM2A:
+                     {
+                         // audio preprocessing params
+@@ -1342,6 +1372,10 @@ struct clip_model_loader {
+         model.norm_embd_b = get_tensor(string_format(TN_NORM_EMBD, "bias"),   false);
+ 
+         model.position_embeddings = get_tensor(string_format(TN_POS_EMBD, prefix), false);
++        if (!model.position_embeddings) {
++            // fallback: standard GGUF name without .weight suffix
++            model.position_embeddings = get_tensor(string_format("%s.position_embd", prefix), false);
++        }
+ 
+         if (model.proj_type == PROJECTOR_TYPE_GEMMA3NV) {
+             hparams.n_layer = 0; // gemma3n does not use normal layer structure
+@@ -1831,6 +1865,20 @@ struct clip_model_loader {
+                         layer.conv_pw2_b   = get_tensor(string_format(TN_CONV_PW2,  prefix, il, "bias"));
+                     }
+                 } break;
++            case PROJECTOR_TYPE_QWEN3ASR:
++                {
++                    model.conv2d_1_w = get_tensor(string_format(TN_CONV2D, 1, "weight"));
++                    model.conv2d_1_b = get_tensor(string_format(TN_CONV2D, 1, "bias"));
++                    model.conv2d_2_w = get_tensor(string_format(TN_CONV2D, 2, "weight"));
++                    model.conv2d_2_b = get_tensor(string_format(TN_CONV2D, 2, "bias"));
++                    model.conv2d_3_w = get_tensor(string_format(TN_CONV2D, 3, "weight"));
++                    model.conv2d_3_b = get_tensor(string_format(TN_CONV2D, 3, "bias"));
++                    model.conv_out_w = get_tensor(string_format(TN_CONV_OUT, "weight"));
++                    model.mm_1_w = get_tensor(string_format(TN_MM_AUDIO_MLP, 1, "weight"));
++                    model.mm_1_b = get_tensor(string_format(TN_MM_AUDIO_MLP, 1, "bias"), false);
++                    model.mm_2_w = get_tensor(string_format(TN_MM_AUDIO_MLP, 2, "weight"));
++                    model.mm_2_b = get_tensor(string_format(TN_MM_AUDIO_MLP, 2, "bias"), false);
++                } break;
+             default:
+                 GGML_ASSERT(false && "unknown projector type");
+         }
+@@ -3307,6 +3355,28 @@ int clip_n_output_tokens(const struct clip_ctx * ctx, struct clip_image_f32 * im
+             {
+                 n_patches = ((((img->nx + 1) / 2) + 1) / 2 + 1) / 2;
+             } break;
++        case PROJECTOR_TYPE_QWEN3ASR:
++            {
++                // Encoder splits input into conv sub-chunks of n_window*2 frames,
++                // applies 3x Conv2d(stride=2, padding=1) per sub-chunk, and
++                // concatenates. Total tokens = sum of per-sub-chunk tokens.
++                const int n_frames = img->nx;
++                const auto & hp = ctx->model.hparams;
++                const int conv_chunk_frames = hp.n_window > 0
++                    ? hp.n_window * 2
++                    : n_frames;
++                const int n_sub_chunks = (n_frames + conv_chunk_frames - 1) / conv_chunk_frames;
++                int total = 0;
++                for (int i = 0; i < n_sub_chunks; i++) {
++                    int f = std::min(conv_chunk_frames, n_frames - i * conv_chunk_frames);
++                    int t = f;
++                    t = (t - 1) / 2 + 1;  // after conv2d_1
++                    t = (t - 1) / 2 + 1;  // after conv2d_2
++                    t = (t - 1) / 2 + 1;  // after conv2d_3
++                    total += t;
++                }
++                n_patches = total;
++            } break;
+         default:
+             GGML_ABORT("unsupported projector type");
+     }
+@@ -3650,6 +3720,12 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
+             {
+                 // do nothing
+             } break;
++        case PROJECTOR_TYPE_QWEN3ASR:
++            {
++                // No inputs needed at eval time — the encoder uses full (unmasked)
++                // attention within each inference window. Block-diagonal restriction
++                // between windows is handled by separate encoder calls.
++            } break;
+         case PROJECTOR_TYPE_LLAMA4:
+             {
+                 // set the 2D positions
+@@ -3777,6 +3853,8 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
+             return ctx->model.position_embeddings->ne[0];
+         case PROJECTOR_TYPE_GLM4V:
+             return ctx->model.mm_ffn_down_w->ne[1];
++        case PROJECTOR_TYPE_QWEN3ASR:
++            return ctx->model.mm_2_w->ne[1];
+         default:
+             GGML_ABORT("Unknown projector type");
+     }
+@@ -3814,6 +3892,7 @@ bool clip_has_whisper_encoder(const struct clip_ctx * ctx) {
+         case PROJECTOR_TYPE_GLMA:
+         case PROJECTOR_TYPE_VOXTRAL:
+         case PROJECTOR_TYPE_MUSIC_FLAMINGO:
++        case PROJECTOR_TYPE_QWEN3ASR:
+             return true;
+         default:
+             return false;
+diff --git a/tools/mtmd/models/models.h b/tools/mtmd/models/models.h
+index 9970980..337c891 100644
+--- a/tools/mtmd/models/models.h
++++ b/tools/mtmd/models/models.h
+@@ -67,6 +67,11 @@ struct clip_graph_whisper_enc : clip_graph {
+     ggml_cgraph * build() override;
+ };
+ 
++struct clip_graph_qwen3asr : clip_graph {
++    clip_graph_qwen3asr(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
++    ggml_cgraph * build() override;
++};
++
+ struct clip_graph_conformer : clip_graph {
+     clip_graph_conformer(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
+     ggml_cgraph * build() override;
+diff --git a/tools/mtmd/mtmd-audio.cpp b/tools/mtmd/mtmd-audio.cpp
+index e8eef03..6e0d657 100644
+--- a/tools/mtmd/mtmd-audio.cpp
++++ b/tools/mtmd/mtmd-audio.cpp
+@@ -514,11 +514,19 @@ bool mtmd_audio_preprocessor_whisper::preprocess(const float *                 s
+         return false;
+     }
+ 
++    const size_t n_samples_orig = n_samples; // save original length before padding
++
+     std::vector<float> smpl;
+     // if input is too short, pad with zeros
+     // this is to avoid potential issues with stage1/2 padding in log_mel_spectrogram
+-    // TODO: maybe handle this better
+-    size_t min_samples = (size_t) hparams.audio_sample_rate * (hparams.audio_chunk_len + 1);  // +1 second margin
++    const bool use_chunked = (hparams.n_window > 0); // Qwen3-ASR uses chunked processing
++    size_t min_samples;
++    if (use_chunked) {
++        // For chunked models, only need enough for the mel computation to succeed
++        min_samples = (size_t) hparams.audio_n_fft + (size_t) hparams.audio_hop_len;
++    } else {
++        min_samples = (size_t) hparams.audio_sample_rate * (hparams.audio_chunk_len + 1);  // +1 second margin
++    }
+     if (n_samples < min_samples) {
+         smpl.resize(min_samples, 0.0f);
+         std::memcpy(smpl.data(), samples, n_samples * sizeof(float));
+@@ -550,31 +558,71 @@ bool mtmd_audio_preprocessor_whisper::preprocess(const float *                 s
+         return false;
+     }
+ 
+-    // because the cgraph in clip.cpp only accepts 3000 frames each, we need to split the mel
+-    // we always expect the mel to have 3000 silent frames at the end
+     if (DEBUG) {
+         printf("output: n_mel = %d, n_len = %d\n", out_full.n_mel, out_full.n_len);
+     }
+-    const size_t frames_per_chunk = 3000;
+-    GGML_ASSERT((size_t) out_full.n_len > frames_per_chunk);
+-    for (size_t off = 0; off < (size_t) out_full.n_len; off += frames_per_chunk) {
+-        int n_len = std::min(frames_per_chunk, (size_t) out_full.n_len - off);
+-        if ((size_t) n_len < frames_per_chunk) {
+-            break;  // last uncomplete chunk will always be a padded chunk, safe to ignore
++
++    if (use_chunked) {
++        // Qwen3-ASR: chunk real audio frames into inference-window-sized blocks.
++        // Each inference window contains multiple conv sub-chunks that share attention
++        // via a block-diagonal mask in the encoder. The encoder splits the window
++        // into conv sub-chunks of n_window*2 frames internally.
++        const int conv_chunk_frames = hparams.n_window * 2;  // 100 for 0.6B
++        const int chunks_per_window = hparams.n_window_infer > 0
++            ? hparams.n_window_infer / conv_chunk_frames      // 800/100 = 8
++            : 1;
++        const int frames_per_chunk = conv_chunk_frames * chunks_per_window;  // 800
++
++        // Only chunk real audio frames (not the 30s silence padding from mel computation)
++        const int n_real_frames = std::min(
++            (int)(n_samples_orig / params.hop_length) + 1,
++            out_full.n_len);
++
++        if (DEBUG) {
++            printf("chunked mode: frames_per_chunk = %d, n_real_frames = %d\n",
++                   frames_per_chunk, n_real_frames);
+         }
+ 
+-        mtmd_audio_mel out_chunk;
+-        out_chunk.n_len     = n_len;
+-        out_chunk.n_mel     = out_full.n_mel;
+-        out_chunk.n_len_org = out_full.n_mel;  // unused
+-        out_chunk.data.reserve(out_chunk.n_mel * out_chunk.n_len);
++        for (int off = 0; off < n_real_frames; off += frames_per_chunk) {
++            int n_len = std::min(frames_per_chunk, n_real_frames - off);
++
++            mtmd_audio_mel out_chunk;
++            out_chunk.n_len     = n_len;
++            out_chunk.n_mel     = out_full.n_mel;
++            out_chunk.n_len_org = n_len;
++            out_chunk.data.reserve(out_chunk.n_mel * out_chunk.n_len);
++
++            for (int i = 0; i < out_full.n_mel; i++) {
++                auto src = out_full.data.begin() + i * out_full.n_len + off;
++                out_chunk.data.insert(out_chunk.data.end(), src, src + n_len);
++            }
+ 
+-        for (int i = 0; i < out_full.n_mel; i++) {
+-            auto src = out_full.data.begin() + i * out_full.n_len + off;
+-            out_chunk.data.insert(out_chunk.data.end(), src, src + frames_per_chunk);
++            output.push_back(std::move(out_chunk));
+         }
++    } else {
++        // Standard Whisper: chunk into 3000-frame blocks (full 30s windows)
++        // We always expect the mel to have 3000 silent frames at the end
++        const size_t frames_per_chunk = 3000;
++        GGML_ASSERT((size_t) out_full.n_len > frames_per_chunk);
++        for (size_t off = 0; off < (size_t) out_full.n_len; off += frames_per_chunk) {
++            int n_len = std::min(frames_per_chunk, (size_t) out_full.n_len - off);
++            if ((size_t) n_len < frames_per_chunk) {
++                break;  // last incomplete chunk will always be a padded chunk, safe to ignore
++            }
++
++            mtmd_audio_mel out_chunk;
++            out_chunk.n_len     = n_len;
++            out_chunk.n_mel     = out_full.n_mel;
++            out_chunk.n_len_org = out_full.n_mel;  // unused
++            out_chunk.data.reserve(out_chunk.n_mel * out_chunk.n_len);
+ 
+-        output.push_back(std::move(out_chunk));
++            for (int i = 0; i < out_full.n_mel; i++) {
++                auto src = out_full.data.begin() + i * out_full.n_len + off;
++                out_chunk.data.insert(out_chunk.data.end(), src, src + frames_per_chunk);
++            }
++
++            output.push_back(std::move(out_chunk));
++        }
+     }
+ 
+     return true;
+diff --git a/tools/mtmd/mtmd.cpp b/tools/mtmd/mtmd.cpp
+index d037e83..85b6bd8 100644
+--- a/tools/mtmd/mtmd.cpp
++++ b/tools/mtmd/mtmd.cpp
+@@ -332,6 +332,7 @@ struct mtmd_context {
+             case PROJECTOR_TYPE_VOXTRAL:
+             case PROJECTOR_TYPE_GLMA:
+             case PROJECTOR_TYPE_MUSIC_FLAMINGO:
++            case PROJECTOR_TYPE_QWEN3ASR:
+                 audio_preproc = std::make_unique<mtmd_audio_preprocessor_whisper>(ctx_a);
+                 break;
+             case PROJECTOR_TYPE_LFM2A:
+@@ -357,6 +358,11 @@ struct mtmd_context {
+         } else if (proj == PROJECTOR_TYPE_MUSIC_FLAMINGO) {
+             // <sound> ... (embeddings) ...
+             aud_beg = "<sound>";
++
++        } else if (proj == PROJECTOR_TYPE_QWEN3ASR) {
++            // <|audio_start|> ... (embeddings) ... <|audio_end|>
++            aud_beg = "<|audio_start|>";
++            aud_end = "<|audio_end|>";
+         }
+     }
+ 
+@@ -692,6 +698,7 @@ struct mtmd_tokenizer {
+                 mel_f32->nx  = mel_spec.n_len;
+                 mel_f32->ny  = mel_spec.n_mel;
+                 mel_f32->buf = std::move(mel_spec.data);
++
+                 size_t n_tokens = clip_n_output_tokens(ctx->ctx_a, mel_f32.get());
+ 
+                 clip_image_f32_batch batch_f32;
+diff --git a/tools/mtmd/models/qwen3asr-enc.cpp b/tools/mtmd/models/qwen3asr-enc.cpp
+new file mode 100644
+index 0000000..27c28cf
+--- /dev/null
++++ b/tools/mtmd/models/qwen3asr-enc.cpp
+@@ -0,0 +1,250 @@
++/**
++ * qwen3asr-enc.cpp — Qwen3-ASR audio encoder graph builder for llama.cpp/mtmd
++ *
++ * Drop this into tools/mtmd/models/ in llama.cpp and register in models.h.
++ *
++ * Architecture (from modeling_qwen3_asr.py):
++ *   1. Conv2d downsampling: 3x Conv2d(stride=2, padding=1) + GELU
++ *      Input:  [1, n_mel=128, T]  (mel spectrogram, mono channel)
++ *      After conv2d1: [480, 64, T/2]
++ *      After conv2d2: [480, 32, T/4]
++ *      After conv2d3: [480, 16, T/8]
++ *   2. Flatten + linear: [T/8, 480*16=7680] → [T/8, 896]
++ *   3. Sinusoidal positional embeddings: [max_pos, 896] (per conv chunk)
++ *   4. 18x encoder layers: pre-LN → self-attn(14 heads, bias) → residual → pre-LN → FFN(GELU) → residual
++ *   5. Post LayerNorm
++ *   6. Output projector: Linear(896,896) + GELU + Linear(896,1024)
++ *
++ * Inference windows (n_window_infer): Multiple conv chunks (n_window*2 frames each)
++ * are grouped into a single encoder call. Conv and positional embeddings are applied
++ * per sub-chunk, then the transformer runs on the concatenated sequence with a
++ * block-diagonal attention mask restricting attention within sub-chunk boundaries.
++ * This matches the PyTorch cu_seqlens-based block-diagonal attention.
++ */
++
++#include "models.h"
++
++// Helper: compute output time steps after 3x Conv2d(stride=2, padding=1)
++static int conv2d_output_len(int n) {
++    n = (n - 1) / 2 + 1;
++    n = (n - 1) / 2 + 1;
++    n = (n - 1) / 2 + 1;
++    return n;
++}
++
++// ---------------------------------------------------------------------------
++// Qwen3-ASR audio encoder graph
++// ---------------------------------------------------------------------------
++
++ggml_cgraph * clip_graph_qwen3asr::build() {
++    // Input: mel spectrogram packed as clip_image_f32
++    //   img.nx = n_frames (time steps) — may span multiple conv chunks
++    //   img.ny = n_mel_bins (128)
++    //   img.buf = [n_mel * n_frames] float32, row-major (mel × time)
++    const int n_frames = img.nx;
++    const int n_mel    = img.ny;
++
++    const int freq_after_conv = conv2d_output_len(n_mel);
++    const int flatten_dim = freq_after_conv * hparams.downsample_hidden_size;
++
++    // -----------------------------------------------------------------------
++    // Sub-chunk parameters
++    // Conv chunks are n_window*2 mel frames each (e.g. 100 for 0.6B).
++    // The mel preprocessor sends inference-window-sized inputs (up to
++    // n_window_infer frames = 8 conv chunks). We split here and recombine.
++    // -----------------------------------------------------------------------
++    const int conv_chunk_frames = hparams.n_window > 0
++        ? hparams.n_window * 2
++        : n_frames;  // fallback: treat entire input as one chunk
++    const int n_sub_chunks = (n_frames + conv_chunk_frames - 1) / conv_chunk_frames;
++
++    // Load raw mel input as flat [n_frames * n_mel] tensor
++    ggml_tensor * inp_raw = build_inp_raw(1);
++
++    // Helper: reshape 3D conv bias [1, 1, OC] → 4D [1, 1, OC, 1] for broadcast
++    auto reshape_conv_bias = [&](ggml_tensor * bias) -> ggml_tensor * {
++        return ggml_reshape_4d(ctx0, bias, 1, 1, bias->ne[2], 1);
++    };
++
++    GGML_ASSERT(model.position_embeddings != nullptr);
++
++    // -----------------------------------------------------------------------
++    // Per-sub-chunk: Conv2d → flatten → project → positional embeddings
++    // Each sub-chunk shares the same conv weights and gets the same
++    // positional embeddings (positions 0..tokens_per_chunk).
++    // -----------------------------------------------------------------------
++    std::vector<ggml_tensor *> sub_embeddings;
++    std::vector<int> sub_token_counts;
++    int total_tokens = 0;
++
++    for (int ci = 0; ci < n_sub_chunks; ci++) {
++        const int start     = ci * conv_chunk_frames;
++        const int chunk_len = std::min(conv_chunk_frames, n_frames - start);
++        const int tokens    = conv2d_output_len(chunk_len);
++
++        sub_token_counts.push_back(tokens);
++        total_tokens += tokens;
++
++        // View into mel data for this sub-chunk: [chunk_len, n_mel] (strided)
++        // inp_raw layout: mel_bin_0[frame_0..n-1], mel_bin_1[frame_0..n-1], ...
++        ggml_tensor * sub_view = ggml_view_2d(ctx0, inp_raw,
++            chunk_len, n_mel,
++            (size_t)n_frames * ggml_type_size(inp_raw->type),
++            (size_t)start * ggml_type_size(inp_raw->type));
++
++        // Make contiguous and reshape to conv input [W=chunk_len, H=n_mel, C=1, N=1]
++        ggml_tensor * sub_inp = ggml_reshape_4d(ctx0, ggml_cont(ctx0, sub_view),
++            chunk_len, n_mel, 1, 1);
++
++        // 3x Conv2d(stride=2, padding=1) + GELU(erf)
++        ggml_tensor * sub_cur;
++
++        sub_cur = ggml_conv_2d(ctx0, model.conv2d_1_w, sub_inp, 2, 2, 1, 1, 1, 1);
++        sub_cur = ggml_add(ctx0, sub_cur, reshape_conv_bias(model.conv2d_1_b));
++        sub_cur = ggml_gelu_erf(ctx0, sub_cur);
++
++        sub_cur = ggml_conv_2d(ctx0, model.conv2d_2_w, sub_cur, 2, 2, 1, 1, 1, 1);
++        sub_cur = ggml_add(ctx0, sub_cur, reshape_conv_bias(model.conv2d_2_b));
++        sub_cur = ggml_gelu_erf(ctx0, sub_cur);
++
++        sub_cur = ggml_conv_2d(ctx0, model.conv2d_3_w, sub_cur, 2, 2, 1, 1, 1, 1);
++        sub_cur = ggml_add(ctx0, sub_cur, reshape_conv_bias(model.conv2d_3_b));
++        sub_cur = ggml_gelu_erf(ctx0, sub_cur);
++
++        // Permute + flatten: [T', F', 480, 1] → [F'*480, T'] → [7680, tokens]
++        sub_cur = ggml_cont(ctx0, ggml_permute(ctx0, sub_cur, 2, 0, 1, 3));
++        sub_cur = ggml_reshape_2d(ctx0, sub_cur, flatten_dim, tokens);
++
++        // Linear projection: [7680, tokens] → [896, tokens]
++        sub_cur = ggml_mul_mat(ctx0, model.conv_out_w, sub_cur);
++
++        // Per-chunk positional embeddings (same positions 0..tokens for every chunk)
++        GGML_ASSERT(model.position_embeddings->ne[1] >= tokens);
++        ggml_tensor * pos_embd = ggml_view_2d(ctx0, model.position_embeddings,
++            model.position_embeddings->ne[0], tokens,
++            model.position_embeddings->nb[1], 0);
++        sub_cur = ggml_add(ctx0, sub_cur, pos_embd);
++
++        cb(sub_cur, "sub_chunk_embd", ci);
++        sub_embeddings.push_back(sub_cur);
++    }
++
++    // -----------------------------------------------------------------------
++    // Concatenate sub-chunk embeddings → [d_model, total_tokens]
++    // -----------------------------------------------------------------------
++    ggml_tensor * cur = sub_embeddings[0];
++    for (int i = 1; i < n_sub_chunks; i++) {
++        cur = ggml_concat(ctx0, cur, sub_embeddings[i], 1);
++    }
++    cb(cur, "after_concat", -1);
++
++    // -----------------------------------------------------------------------
++    // Attention: FULL (unmasked) within each inference window.
++    // The block-diagonal restriction between inference windows is handled
++    // by the mel preprocessor (separate encoder calls per window).
++    // Within a window, all conv sub-chunks attend to each other — this is
++    // the key difference from per-chunk processing and matches the Python
++    // reference's cu_seqlens-based inference-window attention.
++    // -----------------------------------------------------------------------
++
++    // -----------------------------------------------------------------------
++    // Transformer encoder layers (18x) with full attention
++    // Pre-norm: LN → self-attn → residual → LN → FFN(GELU_ERF) → residual
++    // -----------------------------------------------------------------------
++    const int n_pos = total_tokens;
++
++    // Sanity checks
++    GGML_ASSERT(model.layers[0].ln_1_w && model.layers[0].ln_1_b);
++    GGML_ASSERT(model.layers[0].ln_2_w && model.layers[0].ln_2_b);
++    GGML_ASSERT(model.layers[0].q_w && model.layers[0].q_b);
++    GGML_ASSERT(model.layers[0].k_w && model.layers[0].k_b);
++    GGML_ASSERT(model.layers[0].v_w && model.layers[0].v_b);
++    GGML_ASSERT(model.layers[0].o_w && model.layers[0].o_b);
++
++    ggml_tensor * inpL = cur;
++
++    for (int il = 0; il < n_layer; il++) {
++        const auto & layer = model.layers[il];
++        cur = inpL;
++
++        // LayerNorm 1
++        cur = build_norm(cur, layer.ln_1_w, layer.ln_1_b, NORM_TYPE_NORMAL, eps, il);
++        cb(cur, "ln1", il);
++
++        // Self-attention with block-diagonal mask
++        {
++            ggml_tensor * Qcur = ggml_add(ctx0,
++                ggml_mul_mat(ctx0, layer.q_w, cur), layer.q_b);
++            ggml_tensor * Kcur = ggml_add(ctx0,
++                ggml_mul_mat(ctx0, layer.k_w, cur), layer.k_b);
++            ggml_tensor * Vcur = ggml_add(ctx0,
++                ggml_mul_mat(ctx0, layer.v_w, cur), layer.v_b);
++
++            Qcur = ggml_reshape_3d(ctx0, Qcur, d_head, n_head, n_pos);
++            Kcur = ggml_reshape_3d(ctx0, Kcur, d_head, n_head, n_pos);
++            Vcur = ggml_reshape_3d(ctx0, Vcur, d_head, n_head, n_pos);
++
++            cb(Qcur, "Qcur", il);
++            cb(Kcur, "Kcur", il);
++            cb(Vcur, "Vcur", il);
++
++            cur = build_attn(layer.o_w, layer.o_b,
++                Qcur, Kcur, Vcur, nullptr, kq_scale, il);
++            cb(cur, "attn_out", il);
++        }
++
++        // Residual 1
++        cur = ggml_add(ctx0, cur, inpL);
++        inpL = cur;
++
++        cb(cur, "ffn_inp", il);
++
++        // LayerNorm 2
++        cur = build_norm(cur, layer.ln_2_w, layer.ln_2_b, NORM_TYPE_NORMAL, eps, il);
++        cb(cur, "ffn_inp_normed", il);
++
++        // FFN (GELU_ERF)
++        cur = build_ffn(cur,
++            layer.ff_up_w, layer.ff_up_b,
++            layer.ff_gate_w, layer.ff_gate_b,
++            layer.ff_down_w, layer.ff_down_b,
++            FFN_GELU_ERF, il);
++        cb(cur, "ffn_out", il);
++
++        // Residual 2
++        cur = ggml_add(ctx0, inpL, cur);
++        cb(cur, "layer_out", il);
++        inpL = cur;
++    }
++
++    // Post-LayerNorm
++    if (model.post_ln_w) {
++        cur = build_norm(inpL, model.post_ln_w, model.post_ln_b, NORM_TYPE_NORMAL, eps, -1);
++    } else {
++        cur = inpL;
++    }
++    cb(cur, "after_encoder", -1);
++
++    // -----------------------------------------------------------------------
++    // Output projector: Linear(896, 896) + GELU + Linear(896, 1024)
++    // -----------------------------------------------------------------------
++
++    // proj1: Linear(d_model, d_model)
++    cur = ggml_mul_mat(ctx0, model.mm_1_w, cur);
++    if (model.mm_1_b) {
++        cur = ggml_add(ctx0, cur, model.mm_1_b);
++    }
++    cur = ggml_gelu_erf(ctx0, cur);
++    cb(cur, "proj1", -1);
++
++    // proj2: Linear(d_model, output_dim)
++    cur = ggml_mul_mat(ctx0, model.mm_2_w, cur);
++    if (model.mm_2_b) {
++        cur = ggml_add(ctx0, cur, model.mm_2_b);
++    }
++    cb(cur, "proj2", -1);
++
++    ggml_build_forward_expand(gf, cur);
++
++    return gf;
++}
